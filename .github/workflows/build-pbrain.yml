@@ -27,7 +27,7 @@ jobs:
           }
           $b64 = ""
           foreach ($p in $parts) { $b64 += (Get-Content $p -Raw).Trim() }
-          if ($b64.Length -ne 65072) { throw "Unexpected base64 length: $($b64.Length)" }
+          if ($b64.Length -ne 64408) { throw "Unexpected base64 length: $($b64.Length)" }
           $bytes = [Convert]::FromBase64String($b64)
           [IO.File]::WriteAllBytes("$pwd\pbrain_min.zip", $bytes)
           $hash = (Get-FileHash "$pwd\pbrain_min.zip" -Algorithm SHA256).Hash.ToLower()
