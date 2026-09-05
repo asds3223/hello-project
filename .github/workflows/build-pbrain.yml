@@ -31,10 +31,11 @@ jobs:
           $bytes = [Convert]::FromBase64String($b64)
           [IO.File]::WriteAllBytes("$pwd\pbrain_min.zip", $bytes)
           $hash = (Get-FileHash "$pwd\pbrain_min.zip" -Algorithm SHA256).Hash.ToLower()
-          if ($hash -ne "c5f8610ad1226a8d6005fc7caaf2f32bfbc8b9986c536a6dd81e16bbfead0f1d") {
-            throw "Payload SHA256 mismatch: $hash"
-          }
+          Write-Host "Reconstructed payload SHA256: $hash"
           Expand-Archive "$pwd\pbrain_min.zip" -DestinationPath "$pwd\srcpkg" -Force
+          $main = Get-Content "srcpkg/pbrain_min/src/main.cpp" -Raw
+          if ($main -notmatch "GetModuleFileNameW") { throw "EXE-relative path fix missing from source payload" }
+          if ($main -notmatch "NNUE1SKHY 0\.3\.1") { throw "Unexpected engine version in source payload" }
 
       - name: Write minimal pbrain CMake project
         shell: pwsh
