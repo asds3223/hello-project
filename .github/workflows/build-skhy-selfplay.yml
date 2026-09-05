@@ -1,0 +1,107 @@
+name: Build SKHY selfplay Win64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [nnue1skhy-v0.3.1-pbrain]
+    paths:
+      - "training/**"
+      - "pbrain_min_payload/**"
+      - ".github/workflows/build-skhy-selfplay.yml"
+
+jobs:
+  repair-source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconstruct source and inject trainer generator
+        shell: bash
+        run: |
+          cat pbrain_min_payload/source_{00..08}.b64 | tr -d '\r\n' | base64 -d > bad.zip
+          mkdir -p repaired
+          zip -FF bad.zip --out repaired.zip || true
+          unzip -o repaired.zip -d repaired
+          test -f repaired/pbrain_min/src/main.cpp
+          mkdir -p repaired/pbrain_min/src/selfplay
+          cp training/SKHY-selfplay.cpp repaired/pbrain_min/src/selfplay/main.cpp
+          test -f repaired/pbrain_min/src/selfplay/main.cpp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: repaired-skhy-training-source
+          path: repaired/
+          if-no-files-found: error
+
+  build:
+    needs: repair-source
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: repaired-skhy-training-source
+          path: srcpkg
+
+      - name: Locate source
+        shell: pwsh
+        run: |
+          $mf = Get-ChildItem "$pwd\srcpkg" -Recurse -File -Filter main.cpp |
+            Where-Object { $_.FullName -match "selfplay" } | Select-Object -First 1
+          if (-not $mf) { throw "selfplay main.cpp missing" }
+          $root = Split-Path (Split-Path (Split-Path $mf.FullName -Parent) -Parent) -Parent
+          "SKHY_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "SKHY_ROOT=$root"
+
+      - name: Write training CMake
+        shell: pwsh
+        run: |
+          @'
+          cmake_minimum_required(VERSION 3.20)
+          project(SKHYTraining VERSION 1.0 LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 20)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          set(CMAKE_CXX_EXTENSIONS OFF)
+          add_library(skhy_core
+            src/core/position.cpp src/core/config.cpp
+            src/rules/renju.cpp src/rules/renju_reference.cpp
+            src/search/eval.cpp src/search/tt.cpp src/search/search.cpp src/search/threat_solver.cpp
+            src/nnue/nnue.cpp src/nnue/nnue_cuda_stub.cpp
+            src/hardware/hardware.cpp)
+          if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i.86")
+            target_sources(skhy_core PRIVATE src/nnue/nnue_avx2.cpp)
+            target_compile_definitions(skhy_core PRIVATE NNUE1SKHY_AVX2_KERNEL=1)
+            if(MSVC)
+              set_source_files_properties(src/nnue/nnue_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+            endif()
+          endif()
+          target_include_directories(skhy_core PUBLIC src)
+          if(MSVC)
+            target_compile_options(skhy_core PRIVATE /O2 /W4 /permissive-)
+          endif()
+          add_executable(SKHY-selfplay src/selfplay/main.cpp)
+          target_link_libraries(SKHY-selfplay PRIVATE skhy_core)
+          '@ | Set-Content -Encoding ascii "$env:SKHY_ROOT\CMakeLists.txt"
+
+      - name: Configure and build
+        shell: pwsh
+        run: |
+          cmake -S "$env:SKHY_ROOT" -B build -G "Visual Studio 17 2022" -A x64
+          cmake --build build --config Release --target SKHY-selfplay --parallel 2
+
+      - name: Smoke generate one shard
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build/Release/SKHY-selfplay.exe dist/SKHY-selfplay.exe
+          & .\dist\SKHY-selfplay.exe --games 1 --depth 2 --movetime 5 --workers 1 --search-threads 1 --hash-mb 4 --opening-random-plies 2 --record-stride 2 --min-record-ply 2 --max-record-ply 20 --seed 123 --out smoke.bin
+          if ($LASTEXITCODE -ne 0) { throw "selfplay smoke failed" }
+          $size=(Get-Item smoke.bin).Length
+          if ($size -le 0 -or ($size % 72) -ne 0) { throw "bad shard bytes: $size" }
+          Write-Host "smoke shard bytes=$size samples=$($size/72)"
+          Get-FileHash dist/SKHY-selfplay.exe -Algorithm SHA256 |
+            Format-List | Out-File -Encoding ascii dist/SHA256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SKHY-training-selfplay-win64
+          path: dist/
+          if-no-files-found: error
