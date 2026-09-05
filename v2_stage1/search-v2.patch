@@ -1,0 +1,319 @@
+--- a/src/search/search.cpp
++++ b/src/search/search.cpp
+@@ -36,6 +36,68 @@
+     }
+     return false;
+ }
++
++// Cheap local shape estimator used only for move ordering/pruning. Exact wins and
++// Renju forbidden moves are still decided by RenjuRules. The important difference
++// from the old neighbour-only ordering is that broken/open threes are visible.
++int local_shape_score(const Position& pos,Move m,Color c){
++    if(!m.valid() || !pos.empty(m.sq)) return 0;
++    const Cell me=cell_of(c);
++    int score=0;
++    constexpr std::array<int,4> dirs{1,16,17,15};
++    for(size_t di=0;di<dirs.size();++di){
++        // A useful three through m needs at least one nearby own stone. This bitboard
++        // density gate avoids line-window work for the majority of quiet candidates.
++        if(pos.line_neighbor_count4_dir(m.sq,c,static_cast<int>(di))==0) continue;
++        const int d=dirs[di];
++        for(int start=-4;start<=0;++start){
++            int own=0,empty=0; bool blocked=false;
++            for(int i=0;i<5;++i){
++                const int sq=m.sq+(start+i)*d;
++                if(!valid_sq(sq)){blocked=true;break;}
++                const Cell cc=(sq==m.sq)?me:pos.at(sq);
++                if(cc==me) ++own;
++                else if(cc==Cell::Empty) ++empty;
++                else {blocked=true;break;}
++            }
++            if(blocked) continue;
++            if(own>=5) score+=180000;
++            else if(own==4 && empty==1) score+=36000;
++            else if(own==3 && empty==2) score+=5200;
++            else if(own==2 && empty==3) score+=260;
++        }
++        // Open-ended six-cell motifs distinguish genuinely dangerous broken/open
++        // threes from random 3-of-5 windows without invoking recursive legality.
++        for(int start=-5;start<=0;++start){
++            const int a=m.sq+start*d, b=a+5*d;
++            if(!valid_sq(a)||!valid_sq(b)) continue;
++            const Cell ca=(a==m.sq)?me:pos.at(a);
++            const Cell cb=(b==m.sq)?me:pos.at(b);
++            if(ca!=Cell::Empty || cb!=Cell::Empty) continue;
++            int own=0,empty=0; bool blocked=false,contains=false;
++            for(int i=1;i<5;++i){
++                const int sq=a+i*d; contains|=sq==m.sq;
++                if(!valid_sq(sq)){blocked=true;break;}
++                const Cell cc=(sq==m.sq)?me:pos.at(sq);
++                if(cc==me) ++own;
++                else if(cc==Cell::Empty) ++empty;
++                else {blocked=true;break;}
++            }
++            if(blocked || !contains) continue;
++            if(own==4) score+=95000;
++            else if(own==3 && empty==1) score+=14500;
++            else if(own==2 && empty==2) score+=800;
++        }
++    }
++    return std::min(score,240000);
++}
++
++constexpr int kHistoryMax=16384;
++void update_history_value(int& h,int bonus){
++    bonus=std::clamp(bonus,-4096,4096);
++    h += bonus - h*std::abs(bonus)/kHistoryMax;
++    h=std::clamp(h,-kHistoryMax,kHistoryMax);
++}
+ }
+ 
+ 
+@@ -117,18 +179,20 @@
+     out.clear();
+     if(out.capacity()<cand.size()) out.reserve(std::max<size_t>(96,cand.size()));
+     const Color c=pos.side_to_move();
++    const Color opp=opposite(c);
+ 
+-    // If the previous move created a four, preserve every immediate-win defense in
+-    // the deterministic shortlist. This is only computed in genuinely tactical nodes.
+     std::array<uint8_t,SQ_N> forcedDefense{};
+     const int lm=pos.last_move();
+-    if(lm!=NO_SQ && pos.last_color()==opposite(c)
++    if(lm!=NO_SQ && pos.last_color()==opp
+        && may_have_four_through(pos,lm,pos.last_color())
+        && RenjuRules::has_four(pos,lm,pos.last_color())) {
+         FixedMoveList wins; immediate_wins(pos,pos.last_color(),ply,wins);
+         for(int i=0;i<wins.size;++i) forcedDefense[wins[i].sq]=1;
+     }
+ 
++    Move counter;
++    if(lm!=NO_SQ) counter=counterMove_[static_cast<int>(c)][lm];
++
+     for(Move m:cand){
+         bool legal=true, win=false; int fours=0;
+         if(c==Color::Black){
+@@ -138,41 +202,57 @@
+             win=(leg==MoveLegality::Win);
+             fours=a.fourCount;
+         } else {
+-            // White has no forbidden moves.  Win/four ordering information can be
+-            // obtained from the virtual move geometry without mutating Position.
+-            // This avoids a make/undo pair for every white candidate at every node.
+             win=RenjuRules::would_win(pos,m,c);
+             if(!win) fours=RenjuRules::would_create_four(pos,m,c) ? 1 : 0;
+         }
+         if(!legal) continue;
+ 
+-        // staticScore is board-only and deterministic. Candidate pruning uses only
+-        // this score, so TT/history/aspiration re-searches cannot change the move set.
+-        const int dx=std::abs(m.x()-7),dy=std::abs(m.y()-7);
+-        const int neighbors=pos.neighbor_count2(m.sq);
++        // Defensive urgency must be scored from the opponent's geometry too. The
++        // previous implementation only noticed a four after it had already been
++        // played, which made it waste millions of nodes on irrelevant attacks.
++        const bool blockWin=!win && RenjuRules::would_win(pos,m,opp);
++        const bool blockFour=!blockWin && RenjuRules::would_create_four(pos,m,opp);
++        const int attackShape=(win||fours>0)?0:local_shape_score(pos,m,c);
++        const int defenseShape=(blockWin||blockFour)?0:local_shape_score(pos,m,opp);
+         const bool defense=forcedDefense[m.sq]!=0;
+-        int staticScore=(win?1'700'000:0) + fours*120000 + (defense?900'000:0)
+-                        + neighbors*24 + 100-(dx+dy)*4;
+ 
+-        int score=staticScore + history_[static_cast<int>(c)][m.sq];
++        uint8_t threatClass=0;
++        if(win) threatClass=4;
++        else if(fours>0 || blockWin || defense) threatClass=3;
++        else if(blockFour || attackShape>=5000 || defenseShape>=5000) threatClass=2;
++        else if(attackShape>=700 || defenseShape>=700) threatClass=1;
++
++        const int dx=std::abs(m.x()-7),dy=std::abs(m.y()-7);
++        const int neighbors=pos.neighbor_count2(m.sq);
++        int staticScore=(win?4'000'000:0)
++                        +(blockWin?3'200'000:0)
++                        +(defense?2'400'000:0)
++                        +fours*900'000
++                        +(blockFour?480'000:0)
++                        +attackShape*4 + defenseShape*3
++                        +neighbors*32 + 120-(dx+dy)*4;
++
++        const int h=history_[static_cast<int>(c)][m.sq];
++        int score=staticScore + h*12;
++        if(counter.valid() && counter.sq==m.sq) score += 420000;
+         if(ply < static_cast<int>(killers_.size())) {
+-            if(killers_[ply][0].valid() && killers_[ply][0].sq==m.sq) score += 500000;
+-            else if(killers_[ply][1].valid() && killers_[ply][1].sq==m.sq) score += 400000;
++            if(killers_[ply][0].valid() && killers_[ply][0].sq==m.sq) score += 520000;
++            else if(killers_[ply][1].valid() && killers_[ply][1].sq==m.sq) score += 360000;
+         }
+-        if(ttMove.valid() && m.sq==ttMove.sq) score += 2'000'000;
+-        if(rootJitter_ && ply==0 && staticScore<1'000'000) {
++        if(ttMove.valid() && m.sq==ttMove.sq) score += 8'000'000;
++        if(rootJitter_ && ply==0 && threatClass<2) {
+             uint32_t z=static_cast<uint32_t>(m.sq)*0x9E3779B9u + static_cast<uint32_t>(rootJitter_)*0x85EBCA6Bu;
+-            z ^= z>>16; score += static_cast<int>(z%401u)-200;
++            z ^= z>>16; score += static_cast<int>(z%601u)-300;
+         }
+-        out.push_back({m,score,staticScore,win || fours>0 || defense});
++        out.push_back({m,score,staticScore,threatClass,threatClass>=2});
+     }
+     return out;
+ }
+ 
+-int Searcher::threat_quiescence(Position& pos,int ply,int alpha,int beta) {
++int Searcher::threat_quiescence(Position& pos,int ply,int qply,int alpha,int beta) {
+     ++nodes_;
+     if (terminal_loss(pos)) return -SCORE_WIN + ply;
+-    if (ply>8 || should_stop()) return eval_.evaluate(pos);
++    if (qply>=4 || should_stop()) return eval_.evaluate(pos);
+ 
+     const Color stm=pos.side_to_move();
+     const Color opp=opposite(stm);
+@@ -244,7 +324,7 @@
+         Color mover=pos.side_to_move();
+         if(!pos.make_move(sm.m)) continue;
+         eval_.push(sm.m,mover);
+-        int score=-threat_quiescence(pos,ply+1,-beta,-alpha);
++        int score=-threat_quiescence(pos,ply+1,qply+1,-beta,-alpha);
+         eval_.pop(sm.m,mover);
+         pos.undo_move();
+         if(score>=beta) return beta;
+@@ -258,7 +338,7 @@
+     if ((nodes_ & 2047ULL)==0 && should_stop()) return 0;
+     ++nodes_;
+     if (terminal_loss(pos)) return -SCORE_WIN + ply;
+-    if (depth<=0) return useThreatSearch_ ? threat_quiescence(pos,ply,alpha,beta) : eval_.evaluate(pos);
++    if (depth<=0) return useThreatSearch_ ? threat_quiescence(pos,ply,0,alpha,beta) : eval_.evaluate(pos);
+ 
+     const int alphaOrig=alpha;
+     Move ttMove;
+@@ -275,26 +355,41 @@
+ 
+     auto& ordered=ordered_legal_moves(pos,ttMove,ply);
+     if(ordered.empty()) return 0;
+-    if(ordered.size()>static_cast<size_t>(maxCandidates_) && depth<4) {
+-        // Select a deterministic board-based subset first, then restore dynamic
+-        // TT/history/killer ordering inside that subset.
+-        std::sort(ordered.begin(),ordered.end(),[](const ScoredMove& a,const ScoredMove& b){
++    // Width control is tactical-class aware: never discard a forcing move. At
++    // shallow non-root nodes keep the strongest quiets instead of spending most of
++    // the time on radius-2 filler moves.
++    const int widthLimit=depth<=2?maxCandidates_:(depth==3?maxCandidates_+8:(depth==4?maxCandidates_+16:225));
++    if(ordered.size()>static_cast<size_t>(widthLimit) && widthLimit<225) {
++        std::stable_sort(ordered.begin(),ordered.end(),[](const ScoredMove& a,const ScoredMove& b){
++            if(a.threatClass!=b.threatClass) return a.threatClass>b.threatClass;
+             if(a.staticScore!=b.staticScore) return a.staticScore>b.staticScore;
+             return a.move.sq<b.move.sq;
+         });
+-        ordered.resize(static_cast<size_t>(maxCandidates_));
+-        std::sort(ordered.begin(),ordered.end(),[](const ScoredMove& a,const ScoredMove& b){
+-            if(a.score!=b.score) return a.score>b.score;
+-            return a.move.sq<b.move.sq;
+-        });
+-    } else {
+-        std::sort(ordered.begin(),ordered.end(),[](const ScoredMove& a,const ScoredMove& b){return a.score>b.score;});
+-    }
++        size_t keep=static_cast<size_t>(widthLimit);
++        while(keep<ordered.size() && ordered[keep].forcing) ++keep;
++        ordered.resize(keep);
++    }
++    std::stable_sort(ordered.begin(),ordered.end(),[](const ScoredMove& a,const ScoredMove& b){
++        if(a.score!=b.score) return a.score>b.score;
++        return a.move.sq<b.move.sq;
++    });
+ 
+     int best=-SCORE_INF; Move bestMove;
++    const bool pvNode=(beta-alpha)>1;
++    const Color nodeSide=pos.side_to_move();
++    const int parentSq=pos.last_move();
++    std::array<Move,64> quietTried{}; int quietCount=0;
+     bool first=true;
+     for(size_t i=0;i<ordered.size();++i){
+         if(should_stop()) break;
++
++        // Conservative late-move pruning. It is deliberately disabled for PV, TT,
++        // killer/counter/threat moves and only applies at very shallow depth.
++        if(!pvNode && depth<=3 && !ordered[i].forcing && (!ttMove.valid() || ordered[i].move.sq!=ttMove.sq)) {
++            const size_t lmpLimit=depth==1?10u:(depth==2?18u:28u);
++            if(i>=lmpLimit && ordered[i].threatClass==0) continue;
++        }
++
+         Move m=ordered[i].move;
+         Color mover=pos.side_to_move();
+         if(!pos.make_move(m)) continue;
+@@ -302,11 +397,15 @@
+         PVLine childPv;
+         int newDepth=depth-1;
+         int reduction=0;
+-        if(useLmr_ && !first && depth>=3 && i>=6 && !ordered[i].forcing) {
++        if(useLmr_ && !first && depth>=3 && i>=3 && ordered[i].threatClass==0) {
+             reduction=1;
+-            if(depth>=6 && i>=12) reduction=2;
+-            if(depth>=9 && i>=20) reduction=3;
+-            reduction=std::min(reduction,std::max(0,newDepth));
++            if(depth>=5 && i>=8) ++reduction;
++            if(depth>=7 && i>=16) ++reduction;
++            if(!pvNode && depth>=8 && i>=24) ++reduction;
++            const int h=history_[static_cast<int>(mover)][m.sq];
++            if(h>5000) --reduction;
++            if(h<-5000 && depth>=6) ++reduction;
++            reduction=std::clamp(reduction,0,std::max(0,newDepth-1));
+         }
+         int score;
+         if(first || !usePvs_){
+@@ -330,10 +429,20 @@
+             for(int j=0;j<copyLen;++j) pv.moves[static_cast<size_t>(j+1)]=childPv.moves[static_cast<size_t>(j)];
+             pv.length += copyLen;
+         }
+-        if(score>alpha){alpha=score; history_[static_cast<int>(pos.side_to_move())][m.sq]+=depth*depth;}
++        if(ordered[i].threatClass==0 && quietCount<static_cast<int>(quietTried.size())) quietTried[static_cast<size_t>(quietCount++)]=m;
++        if(score>alpha){
++            alpha=score;
++            if(ordered[i].threatClass==0) update_history_value(history_[static_cast<int>(nodeSide)][m.sq],std::min(1024,depth*depth*12));
++        }
+         if(alpha>=beta){
+-            if(ply < static_cast<int>(killers_.size())) {
+-                if(!killers_[ply][0].valid() || killers_[ply][0].sq!=m.sq){killers_[ply][1]=killers_[ply][0];killers_[ply][0]=m;}
++            if(ordered[i].threatClass==0){
++                const int bonus=std::min(4096,depth*depth*48);
++                update_history_value(history_[static_cast<int>(nodeSide)][m.sq],bonus);
++                for(int q=0;q<quietCount-1;++q) update_history_value(history_[static_cast<int>(nodeSide)][quietTried[static_cast<size_t>(q)].sq],-bonus/3);
++                if(parentSq!=NO_SQ) counterMove_[static_cast<int>(nodeSide)][parentSq]=m;
++                if(ply < static_cast<int>(killers_.size())) {
++                    if(!killers_[ply][0].valid() || killers_[ply][0].sq!=m.sq){killers_[ply][1]=killers_[ply][0];killers_[ply][0]=m;}
++                }
+             }
+             break;
+         }
+@@ -348,6 +457,7 @@
+     limits_=limits; nodes_=0; stopped_=false; killers_.assign(128,{});
+     eval_.refresh(pos);
+     std::fill(&history_[0][0],&history_[0][0]+2*SQ_N,0);
++    for(auto& row:counterMove_) for(auto& m:row) m=Move{};
+     auto now=std::chrono::steady_clock::now();
+     deadline_=now+std::chrono::milliseconds(std::max(1,limits.moveTimeMs));
+     SearchResult result;
+--- a/src/search/search.hpp
++++ b/src/search/search.hpp
+@@ -50,6 +50,7 @@
+     bool stopped_ = false;
+     std::vector<std::array<Move,2>> killers_;
+     int history_[2][SQ_N]{};
++    Move counterMove_[2][SQ_N]{};
+     int candidateRadius_ = 2;
+     int maxCandidates_ = 36;
+     int threadCount_ = 1;
+@@ -78,11 +79,11 @@
+     void rebuild_smp_workers();
+     SearchResult search_single(Position& pos, const SearchLimits& limits);
+     int negamax(Position& pos, int depth, int ply, int alpha, int beta, PVLine& pv);
+-    int threat_quiescence(Position& pos, int ply, int alpha, int beta);
++    int threat_quiescence(Position& pos, int ply, int qply, int alpha, int beta);
+     bool terminal_loss(const Position& pos) const;
+     bool should_stop();
+     std::vector<Move> legal_moves(Position& pos);
+-    struct ScoredMove { Move move; int score; int staticScore; bool forcing=false; };
++    struct ScoredMove { Move move; int score; int staticScore; uint8_t threatClass=0; bool forcing=false; };
+     struct FixedMoveList {
+         std::array<Move,SQ_N> moves{};
+         int size=0;
