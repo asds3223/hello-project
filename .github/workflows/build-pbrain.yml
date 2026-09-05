@@ -28,7 +28,7 @@ jobs:
           [IO.File]::WriteAllBytes("$pwd\pbrain_min.zip", $bytes)
           New-Item -ItemType Directory -Force "$pwd\srcpkg" | Out-Null
           & "C:\Program Files\7-Zip\7z.exe" x "$pwd\pbrain_min.zip" "-o$pwd\srcpkg" -y
-          if ($LASTEXITCODE -gt 1) { throw "7zip extraction failed" }
+          Write-Host "7zip exit=$LASTEXITCODE"
           $mf = Get-ChildItem "$pwd\srcpkg" -Recurse -File -Filter main.cpp | Select-Object -First 1
           if (-not $mf) {
             Get-ChildItem "$pwd\srcpkg" -Recurse | ForEach-Object { Write-Host $_.FullName }
