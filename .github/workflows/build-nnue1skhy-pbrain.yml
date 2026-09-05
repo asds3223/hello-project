@@ -15,9 +15,31 @@ jobs:
       - name: Rebuild source archive
         shell: pwsh
         run: |
-          $parts = Get-ChildItem "pbrain_min_payload/source_*.b64" | Sort-Object Name
-          $b64 = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ""
+          $parts = @(
+            "pbrain_min_payload/source_00.b64",
+            "pbrain_min_payload/source_01.b64",
+            "pbrain_min_payload/source_02a.b64",
+            "pbrain_min_payload/source_02b.b64",
+            "pbrain_min_payload/source_02c.b64",
+            "pbrain_min_payload/source_02d.b64",
+            "pbrain_min_payload/source_03.b64",
+            "pbrain_min_payload/source_04.b64",
+            "pbrain_min_payload/source_05.b64",
+            "pbrain_min_payload/source_06.b64",
+            "pbrain_min_payload/source_07.b64",
+            "pbrain_min_payload/source_08.b64"
+          )
+          foreach ($p in $parts) {
+            if (!(Test-Path $p)) { throw "Missing payload: $p" }
+          }
+          $b64 = ($parts | ForEach-Object { (Get-Content $_ -Raw).Trim() }) -join ""
+          if ($b64.Length -ne 65072) { throw "Bad base64 length: $($b64.Length)" }
           [IO.File]::WriteAllBytes("pbrain_min.zip", [Convert]::FromBase64String($b64))
+          $hash = (Get-FileHash "pbrain_min.zip" -Algorithm SHA256).Hash.ToLower()
+          Write-Host "Payload SHA256: $hash"
+          if ($hash -ne "c5f8610ad1226a8d6005fc7caaf2f32bfbc8b9986c536a6dd81e16bbfead0f1d") {
+            throw "Bad payload SHA256: $hash"
+          }
           Expand-Archive -Path "pbrain_min.zip" -DestinationPath "." -Force
 
       - name: Write minimal CMake project
@@ -55,13 +77,13 @@ jobs:
               src/protocol/piskvork.cpp
           )
           target_link_libraries(NNUE1SKHY PRIVATE nnue1skhy_core)
-          '@ | Set-Content -Encoding UTF8 "pbrain_min/CMakeLists.txt"
+          '@ | Set-Content -Encoding ascii "pbrain_min/CMakeLists.txt"
 
-      - name: Configure
-        run: cmake -S pbrain_min -B build -A x64 -DCMAKE_BUILD_TYPE=Release
+      - name: Configure MSVC x64
+        run: cmake -S pbrain_min -B build -A x64
 
-      - name: Build
-        run: cmake --build build --config Release --target NNUE1SKHY -- /m
+      - name: Build Release
+        run: cmake --build build --config Release --target NNUE1SKHY --parallel 2
 
       - name: Piskvork protocol smoke test
         shell: pwsh
@@ -85,13 +107,10 @@ jobs:
           Board: 15x15
           Rule: Renju (INFO rule 4)
           Main file: pbrain-NNUE1SKHY_renju-15.exe
+          '@ | Set-Content -Encoding ascii ".\dist\README.txt"
 
-          Optional NNUE model path:
-            models\NNUE1SKHY.nnue
-          If the model is absent or cannot be loaded, the engine falls back to its CPU evaluator.
-          '@ | Set-Content -Encoding UTF8 ".\dist\README.txt"
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload Win64 pbrain artifact
+        uses: actions/upload-artifact@v4
         with:
           name: NNUE1SKHY-v0.3.1-pbrain-win64
           path: dist/
