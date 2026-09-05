@@ -79,11 +79,11 @@ jobs:
               src/protocol/piskvork.cpp
           )
           target_link_libraries(NNUE1SKHY PRIVATE nnue1skhy_core)
-          '@ | Set-Content -Encoding ascii "srcpkg/pbrain_min/CMakeLists.txt"
+          '@ | Set-Content -Encoding ascii "$env:PBRAIN_ROOT/CMakeLists.txt"
 
       - name: Configure MSVC x64
         shell: pwsh
-        run: cmake -S srcpkg/pbrain_min -B build -A x64
+        run: cmake -S "$env:PBRAIN_ROOT" -B build -A x64
 
       - name: Build Release
         shell: pwsh
@@ -130,7 +130,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist/config | Out-Null
           Copy-Item build/Release/NNUE1SKHY.exe dist/pbrain-NNUE1SKHY_renju-15.exe
-          Copy-Item srcpkg/pbrain_min/config/NNUE1SKHY.toml dist/config/NNUE1SKHY.toml
+          Copy-Item "$env:PBRAIN_ROOT/config/NNUE1SKHY.toml" dist/config/NNUE1SKHY.toml
           @'
           NNUE1SKHY v0.3.1 Win64 pbrain
           Renju 15x15 only.
