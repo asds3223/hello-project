@@ -1,0 +1,98 @@
+name: Build NNUE1SKHY pbrain
+
+on:
+  push:
+    branches:
+      - nnue1skhy-v0.3.1-pbrain
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rebuild source archive
+        shell: pwsh
+        run: |
+          $parts = Get-ChildItem "pbrain_min_payload/source_*.b64" | Sort-Object Name
+          $b64 = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ""
+          [IO.File]::WriteAllBytes("pbrain_min.zip", [Convert]::FromBase64String($b64))
+          Expand-Archive -Path "pbrain_min.zip" -DestinationPath "." -Force
+
+      - name: Write minimal CMake project
+        shell: pwsh
+        run: |
+          @'
+          cmake_minimum_required(VERSION 3.20)
+          project(NNUE1SKHY VERSION 0.3.1 LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 20)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          set(CMAKE_CXX_EXTENSIONS OFF)
+
+          add_library(nnue1skhy_core
+              src/core/position.cpp
+              src/core/config.cpp
+              src/rules/renju.cpp
+              src/search/eval.cpp
+              src/search/tt.cpp
+              src/search/search.cpp
+              src/search/threat_solver.cpp
+              src/nnue/nnue.cpp
+              src/nnue/nnue_avx2.cpp
+              src/nnue/nnue_cuda_stub.cpp
+              src/hardware/hardware.cpp
+          )
+          target_include_directories(nnue1skhy_core PUBLIC src)
+          target_compile_definitions(nnue1skhy_core PRIVATE NNUE1SKHY_AVX2_KERNEL=1)
+          set_source_files_properties(src/nnue/nnue_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+          if(MSVC)
+              target_compile_options(nnue1skhy_core PRIVATE /O2 /W4 /permissive-)
+          endif()
+
+          add_executable(NNUE1SKHY
+              src/main.cpp
+              src/protocol/piskvork.cpp
+          )
+          target_link_libraries(NNUE1SKHY PRIVATE nnue1skhy_core)
+          '@ | Set-Content -Encoding UTF8 "pbrain_min/CMakeLists.txt"
+
+      - name: Configure
+        run: cmake -S pbrain_min -B build -A x64 -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --target NNUE1SKHY -- /m
+
+      - name: Piskvork protocol smoke test
+        shell: pwsh
+        run: |
+          $input = "START 15`nABOUT`nEND`n"
+          $input | & ".\build\Release\NNUE1SKHY.exe" | Tee-Object -FilePath protocol-smoke.txt
+          $out = Get-Content protocol-smoke.txt -Raw
+          if ($out -notmatch "OK") { throw "START 15 did not return OK" }
+          if ($out -notmatch "NNUE1SKHY") { throw "ABOUT did not identify NNUE1SKHY" }
+
+      - name: Package pbrain
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          New-Item -ItemType Directory -Force dist/config | Out-Null
+          Copy-Item ".\build\Release\NNUE1SKHY.exe" ".\dist\pbrain-NNUE1SKHY_renju-15.exe"
+          Copy-Item ".\pbrain_min\config\NNUE1SKHY.toml" ".\dist\config\NNUE1SKHY.toml"
+          @'
+          NNUE1SKHY v0.3.1 Performance
+          Piskvork/Gomocup compatible pbrain executable.
+          Board: 15x15
+          Rule: Renju (INFO rule 4)
+          Main file: pbrain-NNUE1SKHY_renju-15.exe
+
+          Optional NNUE model path:
+            models\NNUE1SKHY.nnue
+          If the model is absent or cannot be loaded, the engine falls back to its CPU evaluator.
+          '@ | Set-Content -Encoding UTF8 ".\dist\README.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NNUE1SKHY-v0.3.1-pbrain-win64
+          path: dist/
+          if-no-files-found: error
