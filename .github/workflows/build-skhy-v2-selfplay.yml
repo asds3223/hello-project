@@ -1,0 +1,113 @@
+name: Build SKHY v2 Rich Selfplay Win64
+on:
+  workflow_dispatch:
+  push:
+    branches: [nnue1skhy-v0.3.1-pbrain]
+    paths:
+      - "training/SKHY-v2-selfplay.cpp"
+      - "v2_stage1/search-v2.patch"
+      - ".github/workflows/build-skhy-v2-selfplay.yml"
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconstruct source
+        shell: bash
+        run: |
+          cat pbrain_min_payload/source_{00..08}.b64 | tr -d '\r\n' | base64 -d > bad.zip
+          mkdir -p repaired
+          zip -FF bad.zip --out repaired.zip || true
+          unzip -o repaired.zip -d repaired
+          cd repaired/pbrain_min
+          patch -p1 < "$GITHUB_WORKSPACE/v2_stage1/search-v2.patch"
+          mkdir -p src/selfplay
+          cp "$GITHUB_WORKSPACE/training/SKHY-v2-selfplay.cpp" src/selfplay/main.cpp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skhy-v2-rich-selfplay-source
+          path: repaired/
+          if-no-files-found: error
+
+  build:
+    needs: repair
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: skhy-v2-rich-selfplay-source
+          path: repaired
+      - name: Locate source
+        shell: pwsh
+        run: |
+          $mf=Get-ChildItem repaired -Recurse -File -Filter main.cpp | Where-Object {$_.FullName -match 'src\\selfplay'} | Select-Object -First 1
+          if(-not $mf){throw "selfplay main missing"}
+          $root=Split-Path (Split-Path (Split-Path $mf.FullName -Parent) -Parent) -Parent
+          "SKHY_ROOT=$root" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Write CMake
+        shell: pwsh
+        run: |
+          @'
+          cmake_minimum_required(VERSION 3.20)
+          project(SKHYV2Rich VERSION 1.0 LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 20)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          add_library(skhy_core
+            src/core/position.cpp src/core/config.cpp
+            src/rules/renju.cpp src/rules/renju_reference.cpp
+            src/search/eval.cpp src/search/tt.cpp src/search/search.cpp src/search/threat_solver.cpp
+            src/nnue/nnue.cpp src/nnue/nnue_cuda_stub.cpp src/hardware/hardware.cpp)
+          target_include_directories(skhy_core PUBLIC src)
+          if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i.86")
+            target_sources(skhy_core PRIVATE src/nnue/nnue_avx2.cpp)
+            target_compile_definitions(skhy_core PRIVATE NNUE1SKHY_AVX2_KERNEL=1)
+            if(MSVC)
+              set_source_files_properties(src/nnue/nnue_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+            endif()
+          endif()
+          if(MSVC)
+            target_compile_options(skhy_core PRIVATE /O2 /W4 /permissive-)
+          endif()
+          add_executable(SKHY-v2-selfplay src/selfplay/main.cpp)
+          target_link_libraries(SKHY-v2-selfplay PRIVATE skhy_core)
+          '@ | Set-Content -Encoding ascii "$env:SKHY_ROOT\CMakeLists.txt"
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake -S "$env:SKHY_ROOT" -B build -G "Visual Studio 17 2022" -A x64
+          cmake --build build --config Release --parallel 2
+      - name: Rich sidecar smoke
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force smoke | Out-Null
+          & build\Release\SKHY-v2-selfplay.exe --games 2 --depth 3 --movetime 15 --workers 1 --search-threads 1 --opening-random-plies 2 --policy-record-topk 4 --topk-probe-ms 2 --topk-probe-depth 2 --uncertainty-probe-prob 0.5 --uncertainty-probe-ms 2 --uncertainty-probe-depth 2 --short-target-probe-prob 0.5 --short-probe-ms 2 --short-probe-depth 2 --out smoke\s.bin --aux-out smoke\s.aux --teacher-out smoke\s.teach
+          if($LASTEXITCODE -ne 0){throw "selfplay smoke failed"}
+          $b=(Get-Item smoke\s.bin).Length;$a=(Get-Item smoke\s.aux).Length;$t=(Get-Item smoke\s.teach).Length
+          if($b -le 0 -or $b%72 -ne 0){throw "bad bin size"}
+          $n=$b/72
+          if($a -ne $n*4){throw "aux count mismatch"}
+          if($t -ne $n*32){throw "teacher count mismatch"}
+          Write-Host "PASS rich sidecars samples=$n bin=$b aux=$a teach=$t"
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build\Release\SKHY-v2-selfplay.exe dist\SKHY-v2-selfplay.exe
+          @'
+          SKHY v2 rich teacher generator
+          Main sample: 72 bytes (compatible with v1)
+          Aux sidecar: 4 bytes/sample
+          Teacher sidecar: 32 bytes/sample
+          Teacher sidecar stores top-4 move/score policy targets, completed depth, nodes,
+          best-vs-second margin, sampled shallow-vs-deep uncertainty, and sampled
+          2-ply/6-ply short-horizon value targets.
+          This build includes SKHY v2 Stage1 search.
+          '@ | Set-Content -Encoding ascii dist\README.txt
+          Get-FileHash dist\SKHY-v2-selfplay.exe -Algorithm SHA256 | ForEach-Object {$_.Hash.ToLower()} | Set-Content -Encoding ascii dist\SHA256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SKHY-v2-rich-selfplay-win64
+          path: dist/
+          if-no-files-found: error
