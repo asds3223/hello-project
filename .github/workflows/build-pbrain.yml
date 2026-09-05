@@ -26,7 +26,10 @@ jobs:
           }
           $bytes = [Convert]::FromBase64String($b64)
           [IO.File]::WriteAllBytes("$pwd\pbrain_min.zip", $bytes)
-          Expand-Archive "$pwd\pbrain_min.zip" -DestinationPath "$pwd\srcpkg" -Force
+          New-Item -ItemType Directory -Force "$pwd\srcpkg" | Out-Null
+          tar -tf "$pwd\pbrain_min.zip"
+          tar -xf "$pwd\pbrain_min.zip" -C "$pwd\srcpkg"
+          if ($LASTEXITCODE -ne 0) { throw "tar extraction failed" }
           $mf = Get-ChildItem "$pwd\srcpkg" -Recurse -File -Filter main.cpp | Select-Object -First 1
           if (-not $mf) {
             Get-ChildItem "$pwd\srcpkg" -Recurse | ForEach-Object { Write-Host $_.FullName }
