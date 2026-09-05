@@ -1,38 +1,16 @@
 --- a/src/main.cpp
 +++ b/src/main.cpp
-@@ -1,13 +1,29 @@
-+#include <filesystem>
- #include <iostream>
- #include <string>
-+#ifdef _WIN32
-+#include <windows.h>
-+#endif
- #include "core/config.hpp"
- #include "hardware/hardware.hpp"
- #include "protocol/piskvork.hpp"
+@@ -26,7 +26,7 @@
  
- using namespace nnue1skhy;
- 
-+static std::filesystem::path executable_dir(const char* argv0) {
-+#ifdef _WIN32
-+    char buf[32768]{};
-+    DWORD n = GetModuleFileNameA(nullptr, buf, static_cast<DWORD>(sizeof(buf)));
-+    if (n > 0 && n < sizeof(buf)) return std::filesystem::path(std::string(buf, n)).parent_path();
-+#endif
-+    std::error_code ec;
-+    auto p = std::filesystem::absolute(argv0 ? argv0 : ".", ec);
-+    return ec ? std::filesystem::current_path() : p.parent_path();
-+}
-+
  int main(int argc,char** argv){
--    std::string cfgPath="config/NNUE1SKHY.toml";
-+    const auto exeDir = executable_dir(argc>0 ? argv[0] : nullptr);
-+    std::string cfgPath=(exeDir / "SKHY.toml").string();
+     const fs::path exeDir = executable_dir(argc > 0 ? argv[0] : nullptr);
+-    fs::path cfgPath = exeDir / "config" / "NNUE1SKHY.toml";
++    fs::path cfgPath = exeDir / "SKHY.toml";
+     bool explicitConfig = false;
      bool benchInfo=false;
      for(int i=1;i<argc;i++){
-         std::string a=argv[i];
-@@ -17,6 +33,13 @@
-     auto hw=detect_hardware(); auto aut=auto_tune(hw); auto cfg=load_config(cfgPath);
+@@ -43,6 +43,13 @@
+     }
      cfg.detectedAutoHashMb=aut.hashMb;
      if(cfg.threads==0) cfg.threads=static_cast<int>(aut.searchThreads);
 -    if(benchInfo){std::cerr<<"NNUE1SKHY 0.3.1 "<<hardware_summary(hw,aut)<<"\n";}
