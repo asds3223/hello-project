@@ -1,0 +1,232 @@
+name: Build SKHY AB pbrains Win64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [nnue1skhy-v0.3.1-pbrain]
+    paths:
+      - "ab_pbrain/**"
+      - "pbrain_min_payload/**"
+      - ".github/workflows/build-skhy-ab.yml"
+
+jobs:
+  repair-source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconstruct and patch source
+        shell: bash
+        run: |
+          cat pbrain_min_payload/source_{00..08}.b64 | tr -d '\r\n' | base64 -d > bad.zip
+          mkdir -p repaired
+          zip -FF bad.zip --out repaired.zip || true
+          unzip -o repaired.zip -d repaired
+          test -f repaired/pbrain_min/src/main.cpp
+          cd repaired/pbrain_min
+          patch -p1 < "$GITHUB_WORKSPACE/ab_pbrain/skhy_ab.patch"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: repaired-skhy-ab-source
+          path: repaired/
+          if-no-files-found: error
+
+  build:
+    needs: repair-source
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: repaired-skhy-ab-source
+          path: srcpkg
+
+      - name: Locate source
+        shell: pwsh
+        run: |
+          $mf = Get-ChildItem "$pwd\srcpkg" -Recurse -File -Filter main.cpp | Select-Object -First 1
+          if (-not $mf) { throw "main.cpp missing" }
+          $root = Split-Path (Split-Path $mf.FullName -Parent) -Parent
+          "SKHY_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Write A/B CMake
+        shell: pwsh
+        run: |
+          @'
+          cmake_minimum_required(VERSION 3.20)
+          project(SKHYAB VERSION 1.0 LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 20)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          set(CMAKE_CXX_EXTENSIONS OFF)
+          add_library(skhy_core
+            src/core/position.cpp src/core/config.cpp
+            src/rules/renju.cpp src/rules/renju_reference.cpp
+            src/search/eval.cpp src/search/tt.cpp src/search/search.cpp src/search/threat_solver.cpp
+            src/nnue/nnue.cpp src/nnue/nnue_cuda_stub.cpp
+            src/hardware/hardware.cpp)
+          if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i.86")
+            target_sources(skhy_core PRIVATE src/nnue/nnue_avx2.cpp)
+            target_compile_definitions(skhy_core PRIVATE NNUE1SKHY_AVX2_KERNEL=1)
+            if(MSVC)
+              set_source_files_properties(src/nnue/nnue_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+            endif()
+          endif()
+          target_include_directories(skhy_core PUBLIC src)
+          if(MSVC)
+            target_compile_options(skhy_core PRIVATE /O2 /W4 /permissive-)
+          endif()
+          add_executable(SKHY-Classical src/main.cpp src/protocol/piskvork.cpp)
+          target_link_libraries(SKHY-Classical PRIVATE skhy_core)
+          target_compile_definitions(SKHY-Classical PRIVATE SKHY_FORCE_CLASSICAL=1)
+          add_executable(SKHY-NNUE src/main.cpp src/protocol/piskvork.cpp)
+          target_link_libraries(SKHY-NNUE PRIVATE skhy_core)
+          target_compile_definitions(SKHY-NNUE PRIVATE SKHY_FORCE_NNUE=1)
+          '@ | Set-Content -Encoding ascii "$env:SKHY_ROOT\CMakeLists.txt"
+
+      - name: Configure and build
+        shell: pwsh
+        run: |
+          cmake -S "$env:SKHY_ROOT" -B build -G "Visual Studio 17 2022" -A x64
+          cmake --build build --config Release --target SKHY-Classical SKHY-NNUE --parallel 2
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist\Classical,dist\NNUE | Out-Null
+          Copy-Item build\Release\SKHY-Classical.exe dist\Classical\pbrain-SKHY-Classical.exe
+          Copy-Item build\Release\SKHY-NNUE.exe dist\NNUE\pbrain-SKHY-NNUE.exe
+          $cfg=@'
+          [cpu]
+          threads = "auto"
+          simd = "auto"
+          [memory]
+          hash_mb = 0
+          max_memory_mb = 0
+          [evaluation]
+          mode = "nnue"
+          backend = "auto"
+          [search]
+          max_depth = 64
+          max_nodes = 0
+          pvs = true
+          aspiration = true
+          aspiration_window = 2048
+          lmr = true
+          [threat]
+          enabled = true
+          vcf = true
+          vcf_max_ply = 32
+          vcf_max_nodes = 150000
+          vcf_time_percent = 15
+          vct = true
+          vct_max_ply = 18
+          vct_max_nodes = 120000
+          vct_time_percent = 20
+          [movegen]
+          radius = 2
+          max_candidates = 36
+          [time]
+          move_time_ms = 1000
+          move_overhead_ms = 30
+          '@
+          $cfg | Set-Content -Encoding ascii dist\Classical\SKHY.toml
+          $cfg | Set-Content -Encoding ascii dist\NNUE\SKHY.toml
+          @'
+          Put your trained model here:
+            SKHY-Training-Kit\models\SKHY-candidate.nnue
+          Rename/copy it to:
+            SKHY.nnue
+          It MUST be in the same folder as pbrain-SKHY-NNUE.exe.
+          The NNUE pbrain refuses START 15 if loading fails, so an accidental classical fallback cannot contaminate A/B results.
+          '@ | Set-Content -Encoding ascii dist\NNUE\PUT_SKHY_NNUE_HERE.txt
+          @'
+          @echo off
+          if "%~1"=="" (
+            echo Drag SKHY-candidate.nnue onto this BAT.
+            pause
+            exit /b 1
+          )
+          copy /Y "%~1" "%~dp0NNUE\SKHY.nnue" >nul || exit /b 1
+          echo Installed: %~dp0NNUE\SKHY.nnue
+          pause
+          '@ | Set-Content -Encoding ascii dist\INSTALL_CANDIDATE_NNUE.bat
+          @'
+          SKHY A/B TEST PACKAGE
+
+          1) Drag models\SKHY-candidate.nnue onto INSTALL_CANDIDATE_NNUE.bat.
+          2) In Piskvork add:
+             Classical\pbrain-SKHY-Classical.exe
+             NNUE\pbrain-SKHY-NNUE.exe
+          3) Use Renju 15x15, same clock/memory for both, alternating colors.
+          4) Check messages:
+             Classical: MESSAGE SKHY variant=Classical eval=classical
+             NNUE:      MESSAGE SKHY variant=NNUE nnue=YES backend=avx2
+          5) Each move also prints depth/nodes/nps/score/time/eval.
+          6) Do NOT promote candidate until the NNUE version wins the A/B test.
+          '@ | Set-Content -Encoding ascii dist\README_AB.txt
+
+      - name: Create temporary valid zero NNUE for load smoke
+        shell: pwsh
+        run: |
+          $path=(Resolve-Path dist\NNUE).Path + "\SKHY.nnue"
+          $fs=[IO.File]::Open($path,[IO.FileMode]::Create,[IO.FileAccess]::Write)
+          $bw=[IO.BinaryWriter]::new($fs)
+          $bw.Write([Text.Encoding]::ASCII.GetBytes("N1SKHY1"))
+          $bw.Write([byte]0)
+          foreach($v in @(1,450,256,64,32)){ $bw.Write([uint32]$v) }
+          foreach($v in @(0,8,2)){ $bw.Write([int32]$v) }
+          $remaining=249804-40
+          $buf=New-Object byte[] 65536
+          while($remaining -gt 0){ $n=[Math]::Min($remaining,$buf.Length); $bw.Write($buf,0,$n); $remaining-=$n }
+          $bw.Close(); $fs.Close()
+          if((Get-Item $path).Length -ne 249804){throw "bad NNUE smoke file size"}
+
+      - name: Protocol and evaluator smoke
+        shell: pwsh
+        run: |
+          function Run-Brain($exe,$commands){
+            $psi=[Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName=(Resolve-Path $exe).Path
+            $psi.WorkingDirectory=(Split-Path $psi.FileName -Parent)
+            $psi.UseShellExecute=$false
+            $psi.RedirectStandardInput=$true
+            $psi.RedirectStandardOutput=$true
+            $p=[Diagnostics.Process]::new(); $p.StartInfo=$psi; [void]$p.Start()
+            foreach($c in $commands){$p.StandardInput.WriteLine($c)}
+            $p.StandardInput.Close()
+            if(-not $p.WaitForExit(15000)){ $p.Kill(); throw "timeout $exe" }
+            return $p.StandardOutput.ReadToEnd()
+          }
+          $cmd=@("START 15","INFO rule 4","INFO timeout_turn 30","BEGIN","ABOUT","END")
+          $c=Run-Brain "dist\Classical\pbrain-SKHY-Classical.exe" $cmd
+          Write-Host "CLASSICAL"
+          Write-Host $c
+          if($c -notmatch "variant=Classical eval=classical"){throw "classical marker missing"}
+          if($c -notmatch "MESSAGE SKHY depth="){throw "classical telemetry missing"}
+          if($c -notmatch 'name="SKHY-Classical"'){throw "classical ABOUT missing"}
+          $n=Run-Brain "dist\NNUE\pbrain-SKHY-NNUE.exe" $cmd
+          Write-Host "NNUE"
+          Write-Host $n
+          if($n -notmatch "variant=NNUE nnue=YES backend="){throw "NNUE load marker missing"}
+          if($n -notmatch "MESSAGE SKHY depth="){throw "NNUE telemetry missing"}
+          if($n -notmatch 'name="SKHY-NNUE"'){throw "NNUE ABOUT missing"}
+          Remove-Item dist\NNUE\SKHY.nnue -Force
+          $miss=Run-Brain "dist\NNUE\pbrain-SKHY-NNUE.exe" @("START 15","END")
+          Write-Host "NNUE-MISSING"
+          Write-Host $miss
+          if($miss -notmatch "ERROR SKHY NNUE load failed"){throw "missing-NNUE fail-closed test failed"}
+
+      - name: Hash and upload
+        shell: pwsh
+        run: |
+          $lines=@()
+          Get-ChildItem dist -Recurse -File | Where-Object {$_.Name -like "*.exe"} | ForEach-Object {
+            $h=Get-FileHash $_.FullName -Algorithm SHA256
+            $rel=$_.FullName.Substring((Resolve-Path dist).Path.Length+1)
+            $lines += "$($h.Hash.ToLower())  $rel"
+          }
+          $lines | Set-Content -Encoding ascii dist\SHA256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SKHY-AB-pbrains-win64
+          path: dist/
+          if-no-files-found: error
