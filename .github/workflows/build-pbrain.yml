@@ -9,36 +9,45 @@ on:
       - ".github/workflows/build-pbrain.yml"
 
 jobs:
+  repair-source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconstruct and repair source ZIP
+        shell: bash
+        run: |
+          cat pbrain_min_payload/source_{00..08}.b64 | tr -d '\r\n' | base64 -d > bad.zip
+          mkdir -p repaired
+          zip -FF bad.zip --out repaired.zip || true
+          unzip -o repaired.zip -d repaired
+          test -f repaired/pbrain_min/src/main.cpp
+          echo "source repair OK"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: repaired-pbrain-source
+          path: repaired/
+          if-no-files-found: error
+
   build:
+    needs: repair-source
     runs-on: windows-2022
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: repaired-pbrain-source
+          path: srcpkg
 
-      - name: Reconstruct source archive
+      - name: Locate source
         shell: pwsh
         run: |
-          $parts = 0..8 | ForEach-Object { "pbrain_min_payload/source_{0:D2}.b64" -f $_ }
-          $b64 = ""
-          foreach ($p in $parts) {
-            if (!(Test-Path $p)) { throw "Missing $p" }
-            $b64 += (Get-Content $p -Raw).Trim()
-          }
-          $bytes = [Convert]::FromBase64String($b64)
-          [IO.File]::WriteAllBytes("$pwd\pbrain_min.zip", $bytes)
-          New-Item -ItemType Directory -Force "$pwd\srcpkg" | Out-Null
-          & "C:\Program Files\7-Zip\7z.exe" x "$pwd\pbrain_min.zip" "-o$pwd\srcpkg" -y
-          Write-Host "7zip exit=$LASTEXITCODE"
           $mf = Get-ChildItem "$pwd\srcpkg" -Recurse -File -Filter main.cpp | Select-Object -First 1
-          if (-not $mf) {
-            Get-ChildItem "$pwd\srcpkg" -Recurse | ForEach-Object { Write-Host $_.FullName }
-            throw "src/main.cpp not found"
-          }
+          if (-not $mf) { throw "main.cpp missing" }
           $root = Split-Path (Split-Path $mf.FullName -Parent) -Parent
-          Write-Host "PBRAIN_ROOT=$root"
           "PBRAIN_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "PBRAIN_ROOT=$root"
 
-      - name: Write CMake
+      - name: Write minimal CMake
         shell: pwsh
         run: |
           @'
@@ -68,15 +77,13 @@ jobs:
           target_link_libraries(NNUE1SKHY PRIVATE nnue1skhy_core)
           '@ | Set-Content -Encoding ascii "$env:PBRAIN_ROOT\CMakeLists.txt"
 
-      - name: Configure
+      - name: Configure and build
         shell: pwsh
-        run: cmake -S "$env:PBRAIN_ROOT" -B build -G "Visual Studio 17 2022" -A x64
+        run: |
+          cmake -S "$env:PBRAIN_ROOT" -B build -G "Visual Studio 17 2022" -A x64
+          cmake --build build --config Release --target NNUE1SKHY --parallel 2
 
-      - name: Build
-        shell: pwsh
-        run: cmake --build build --config Release --target NNUE1SKHY --parallel 2
-
-      - name: Package
+      - name: Package pbrain
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
@@ -92,25 +99,21 @@ jobs:
       - name: Protocol smoke
         shell: pwsh
         run: |
-          $exe = (Resolve-Path "dist/pbrain-NNUE1SKHY_renju-15.exe").Path
-          $psi = [System.Diagnostics.ProcessStartInfo]::new()
-          $psi.FileName = $exe
-          $psi.UseShellExecute = $false
-          $psi.RedirectStandardInput = $true
-          $psi.RedirectStandardOutput = $true
-          $psi.RedirectStandardError = $true
-          $p = [System.Diagnostics.Process]::new()
-          $p.StartInfo = $psi
-          [void]$p.Start()
+          $exe=(Resolve-Path "dist/pbrain-NNUE1SKHY_renju-15.exe").Path
+          $psi=[Diagnostics.ProcessStartInfo]::new()
+          $psi.FileName=$exe
+          $psi.UseShellExecute=$false
+          $psi.RedirectStandardInput=$true
+          $psi.RedirectStandardOutput=$true
+          $p=[Diagnostics.Process]::new(); $p.StartInfo=$psi; [void]$p.Start()
           $p.StandardInput.WriteLine("START 15")
           $p.StandardInput.WriteLine("ABOUT")
           $p.StandardInput.WriteLine("END")
           $p.StandardInput.Close()
-          if (-not $p.WaitForExit(15000)) { $p.Kill(); throw "timeout" }
-          $out = $p.StandardOutput.ReadToEnd()
-          Write-Host $out
-          if ($out -notmatch "(?m)^OK\r?$") { throw "START failed" }
-          if ($out -notmatch "name=") { throw "ABOUT failed" }
+          if(-not $p.WaitForExit(15000)){ $p.Kill(); throw "timeout" }
+          $out=$p.StandardOutput.ReadToEnd(); Write-Host $out
+          if($out -notmatch "(?m)^OK\r?$"){ throw "START 15 failed" }
+          if($out -notmatch "name="){ throw "ABOUT failed" }
 
       - uses: actions/upload-artifact@v4
         with:
