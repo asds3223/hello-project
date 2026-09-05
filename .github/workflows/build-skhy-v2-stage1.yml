@@ -1,0 +1,170 @@
+name: Build SKHY v2 Stage1 Search Win64
+on:
+  workflow_dispatch:
+  push:
+    branches: [nnue1skhy-v0.3.1-pbrain]
+    paths:
+      - "v2_stage1/**"
+      - ".github/workflows/build-skhy-v2-stage1.yml"
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconstruct source
+        shell: bash
+        run: |
+          cat pbrain_min_payload/source_{00..08}.b64 | tr -d '\r\n' | base64 -d > bad.zip
+          mkdir -p repaired
+          zip -FF bad.zip --out repaired.zip || true
+          unzip -o repaired.zip -d repaired
+          cd repaired/pbrain_min
+          patch -p1 < "$GITHUB_WORKSPACE/ab_pbrain/skhy_ab.patch"
+          mkdir -p src/search
+          cat "$GITHUB_WORKSPACE/v2_stage1/search.cpp.gz.b64" | tr -d '\r\n' | base64 -d | gzip -d > src/search/search.cpp
+          cat "$GITHUB_WORKSPACE/v2_stage1/search.hpp.gz.b64" | tr -d '\r\n' | base64 -d | gzip -d > src/search/search.hpp
+      - name: Write CMake
+        shell: pwsh
+        run: |
+          $root=(Resolve-Path "repaired\pbrain_min").Path
+          @'
+          cmake_minimum_required(VERSION 3.20)
+          project(SKHYV2S1 VERSION 1.0 LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 20)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          add_library(skhy_core
+            src/core/position.cpp src/core/config.cpp
+            src/rules/renju.cpp src/rules/renju_reference.cpp
+            src/search/eval.cpp src/search/tt.cpp src/search/search.cpp src/search/threat_solver.cpp
+            src/nnue/nnue.cpp src/nnue/nnue_cuda_stub.cpp src/hardware/hardware.cpp)
+          target_include_directories(skhy_core PUBLIC src)
+          if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i.86")
+            target_sources(skhy_core PRIVATE src/nnue/nnue_avx2.cpp)
+            target_compile_definitions(skhy_core PRIVATE NNUE1SKHY_AVX2_KERNEL=1)
+            if(MSVC)
+              set_source_files_properties(src/nnue/nnue_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+            endif()
+          endif()
+          if(MSVC)
+            target_compile_options(skhy_core PRIVATE /O2 /W4 /permissive-)
+          endif()
+          add_executable(SKHY-v2-Classical src/main.cpp src/protocol/piskvork.cpp)
+          target_link_libraries(SKHY-v2-Classical PRIVATE skhy_core)
+          target_compile_definitions(SKHY-v2-Classical PRIVATE SKHY_FORCE_CLASSICAL=1)
+          add_executable(SKHY-v2-NNUE src/main.cpp src/protocol/piskvork.cpp)
+          target_link_libraries(SKHY-v2-NNUE PRIVATE skhy_core)
+          target_compile_definitions(SKHY-v2-NNUE PRIVATE SKHY_FORCE_NNUE=1)
+          '@ | Set-Content -Encoding ascii "$root\CMakeLists.txt"
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake -S repaired\pbrain_min -B build -G "Visual Studio 17 2022" -A x64
+          cmake --build build --config Release --parallel 2
+      - name: Package configs
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist\Classical,dist\NNUE | Out-Null
+          Copy-Item build\Release\SKHY-v2-Classical.exe dist\Classical\pbrain-SKHY-v2-Classical.exe
+          Copy-Item build\Release\SKHY-v2-NNUE.exe dist\NNUE\pbrain-SKHY-v2-NNUE.exe
+          $cfg=@'
+          [cpu]
+          threads = "auto"
+          simd = "auto"
+          [memory]
+          hash_mb = 0
+          max_memory_mb = 0
+          [evaluation]
+          mode = "nnue"
+          backend = "auto"
+          [search]
+          max_depth = 64
+          max_nodes = 0
+          pvs = true
+          aspiration = true
+          aspiration_window = 2048
+          lmr = true
+          [threat]
+          enabled = true
+          vcf = true
+          vcf_max_ply = 32
+          vcf_max_nodes = 150000
+          vcf_time_percent = 15
+          vct = true
+          vct_max_ply = 18
+          vct_max_nodes = 120000
+          vct_time_percent = 20
+          [movegen]
+          radius = 2
+          max_candidates = 36
+          [time]
+          move_time_ms = 1000
+          move_overhead_ms = 30
+          '@
+          $cfg | Set-Content -Encoding ascii dist\Classical\SKHY.toml
+          $cfg | Set-Content -Encoding ascii dist\NNUE\SKHY.toml
+          @'
+          Copy your existing SKHY-candidate.nnue here and rename it to SKHY.nnue.
+          The NNUE build fails closed if the file cannot be loaded.
+          '@ | Set-Content -Encoding ascii dist\NNUE\PUT_SKHY_NNUE_HERE.txt
+          @'
+          SKHY v2 Stage 1 - search overhaul
+          - qsearch uses independent qply (fixes deep-node qsearch shutdown)
+          - own/opponent tactical shape ordering
+          - open/broken-three-aware local shape score
+          - counter-move heuristic
+          - bounded/gravity history
+          - tactical-class-aware width control
+          - dynamic verified LMR
+          - conservative late-move pruning with tactical protection
+          - TT/killer/history ordering retained
+          This stage intentionally keeps the old NNUE architecture so search gains can be tested independently.
+          '@ | Set-Content -Encoding ascii dist\README_STAGE1.txt
+      - name: Classical protocol smoke
+        shell: pwsh
+        run: |
+          $psi=[Diagnostics.ProcessStartInfo]::new()
+          $psi.FileName=(Resolve-Path "dist\Classical\pbrain-SKHY-v2-Classical.exe").Path
+          $psi.WorkingDirectory=(Split-Path $psi.FileName -Parent)
+          $psi.UseShellExecute=$false;$psi.RedirectStandardInput=$true;$psi.RedirectStandardOutput=$true
+          $p=[Diagnostics.Process]::new();$p.StartInfo=$psi;[void]$p.Start()
+          @("START 15","INFO rule 4","INFO timeout_turn 50","BEGIN","ABOUT","END") | % {$p.StandardInput.WriteLine($_)}
+          $p.StandardInput.Close()
+          if(-not $p.WaitForExit(15000)){$p.Kill();throw "timeout"}
+          $o=$p.StandardOutput.ReadToEnd();Write-Host $o
+          if($o -notmatch "variant=Classical eval=classical"){throw "classical marker missing"}
+          if($o -notmatch "MESSAGE SKHY depth="){throw "search telemetry missing"}
+      - name: Create valid zero NNUE and smoke
+        shell: pwsh
+        run: |
+          $path=(Resolve-Path dist\NNUE).Path+"\SKHY.nnue"
+          $fs=[IO.File]::Open($path,[IO.FileMode]::Create,[IO.FileAccess]::Write);$bw=[IO.BinaryWriter]::new($fs)
+          $bw.Write([Text.Encoding]::ASCII.GetBytes("N1SKHY1"));$bw.Write([byte]0)
+          foreach($v in @(1,450,256,64,32)){$bw.Write([uint32]$v)}
+          foreach($v in @(0,8,2)){$bw.Write([int32]$v)}
+          $remaining=249804-40;$buf=New-Object byte[] 65536
+          while($remaining -gt 0){$n=[Math]::Min($remaining,$buf.Length);$bw.Write($buf,0,$n);$remaining-=$n}
+          $bw.Close();$fs.Close()
+          $psi=[Diagnostics.ProcessStartInfo]::new()
+          $psi.FileName=(Resolve-Path "dist\NNUE\pbrain-SKHY-v2-NNUE.exe").Path
+          $psi.WorkingDirectory=(Split-Path $psi.FileName -Parent)
+          $psi.UseShellExecute=$false;$psi.RedirectStandardInput=$true;$psi.RedirectStandardOutput=$true
+          $p=[Diagnostics.Process]::new();$p.StartInfo=$psi;[void]$p.Start()
+          @("START 15","INFO rule 4","INFO timeout_turn 50","BEGIN","END") | % {$p.StandardInput.WriteLine($_)}
+          $p.StandardInput.Close()
+          if(-not $p.WaitForExit(15000)){$p.Kill();throw "timeout"}
+          $o=$p.StandardOutput.ReadToEnd();Write-Host $o
+          if($o -notmatch "variant=NNUE nnue=YES backend="){throw "NNUE marker missing"}
+          Remove-Item $path -Force
+      - name: Hash
+        shell: pwsh
+        run: |
+          Get-ChildItem dist -Recurse -File | % {
+            $h=Get-FileHash $_.FullName -Algorithm SHA256
+            "$($h.Hash.ToLower())  $($_.FullName.Substring((Resolve-Path dist).Path.Length+1))"
+          } | Set-Content -Encoding ascii dist\SHA256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SKHY-v2-stage1-search-win64
+          path: dist/
+          if-no-files-found: error
