@@ -1,0 +1,146 @@
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1,13 +1,29 @@
++#include <filesystem>
+ #include <iostream>
+ #include <string>
++#ifdef _WIN32
++#include <windows.h>
++#endif
+ #include "core/config.hpp"
+ #include "hardware/hardware.hpp"
+ #include "protocol/piskvork.hpp"
+ 
+ using namespace nnue1skhy;
+ 
++static std::filesystem::path executable_dir(const char* argv0) {
++#ifdef _WIN32
++    char buf[32768]{};
++    DWORD n = GetModuleFileNameA(nullptr, buf, static_cast<DWORD>(sizeof(buf)));
++    if (n > 0 && n < sizeof(buf)) return std::filesystem::path(std::string(buf, n)).parent_path();
++#endif
++    std::error_code ec;
++    auto p = std::filesystem::absolute(argv0 ? argv0 : ".", ec);
++    return ec ? std::filesystem::current_path() : p.parent_path();
++}
++
+ int main(int argc,char** argv){
+-    std::string cfgPath="config/NNUE1SKHY.toml";
++    const auto exeDir = executable_dir(argc>0 ? argv[0] : nullptr);
++    std::string cfgPath=(exeDir / "SKHY.toml").string();
+     bool benchInfo=false;
+     for(int i=1;i<argc;i++){
+         std::string a=argv[i];
+@@ -17,6 +33,13 @@
+     auto hw=detect_hardware(); auto aut=auto_tune(hw); auto cfg=load_config(cfgPath);
+     cfg.detectedAutoHashMb=aut.hashMb;
+     if(cfg.threads==0) cfg.threads=static_cast<int>(aut.searchThreads);
+-    if(benchInfo){std::cerr<<"NNUE1SKHY 0.3.1 "<<hardware_summary(hw,aut)<<"\n";}
++#if defined(SKHY_FORCE_CLASSICAL)
++    cfg.evalMode="classical";
++    cfg.nnuePath.clear();
++#elif defined(SKHY_FORCE_NNUE)
++    cfg.evalMode="nnue";
++    cfg.nnuePath=(exeDir / "SKHY.nnue").string();
++#endif
++    if(benchInfo){std::cerr<<"SKHY A/B "<<hardware_summary(hw,aut)<<"\n";}
+     PiskvorkProtocol protocol(cfg); return protocol.run();
+ }
+--- a/src/protocol/piskvork.hpp
++++ b/src/protocol/piskvork.hpp
+@@ -24,6 +24,10 @@
+     uint64_t maxMemoryBytes_ = 0;
+     int ruleMask_ = 4;
+     bool memoryPolicyApplied_ = false;
++    bool nnueRequested_ = false;
++    bool nnueLoaded_ = false;
++    std::string nnueError_;
++    std::string variant_ = "SKHY";
+     struct PlayedMove { Move move{}; Color color=Color::Black; };
+     std::vector<PlayedMove> moveHistory_;
+ 
+@@ -36,6 +40,7 @@
+     void ensure_memory_policy();
+     void rebuild_from_history();
+     bool handle_takeback(const std::string& rest);
++    void print_eval_message() const;
+ };
+ 
+ } // namespace nnue1skhy
+--- a/src/protocol/piskvork.cpp
++++ b/src/protocol/piskvork.cpp
+@@ -1,5 +1,6 @@
+ #include "piskvork.hpp"
+ #include <algorithm>
++#include <chrono>
+ #include <iostream>
+ #include <sstream>
+ #include <vector>
+@@ -21,7 +22,27 @@
+     if((cfg.cudaMode=="false" || cfg.cudaMode=="off" || cfg.cudaMode=="0") && evalBackend=="cuda") evalBackend="auto";
+     searcher_.set_eval_backend(evalBackend,cfg.cudaDevice,cfg.cudaMaxBatch);
+     searcher_.set_vcf(cfg.vcf,cfg.vcfMaxPly,cfg.vcfMaxNodes,cfg.vcfTimePercent); searcher_.set_vct(cfg.vct,cfg.vctMaxPly,cfg.vctMaxNodes,cfg.vctTimePercent);
+-    if(cfg.evalMode!="classical") searcher_.load_nnue(cfg.nnuePath,&err); // silent fallback to classical evaluator
++#if defined(SKHY_FORCE_CLASSICAL)
++    variant_="SKHY-Classical";
++#elif defined(SKHY_FORCE_NNUE)
++    variant_="SKHY-NNUE";
++#else
++    variant_="SKHY";
++#endif
++    nnueRequested_ = cfg.evalMode!="classical";
++    if(nnueRequested_){
++        nnueLoaded_ = searcher_.load_nnue(cfg.nnuePath,&err);
++        if(!nnueLoaded_) nnueError_=err.empty()?"unknown load error":err;
++    }
++}
++
++void PiskvorkProtocol::print_eval_message() const {
++    if(nnueRequested_){
++        if(nnueLoaded_) std::cout<<"MESSAGE SKHY variant=NNUE nnue=YES backend="<<searcher_.nnue_backend_name()<<"\n"<<std::flush;
++        else std::cout<<"MESSAGE SKHY variant=NNUE nnue=NO error="<<nnueError_<<"\n"<<std::flush;
++    } else {
++        std::cout<<"MESSAGE SKHY variant=Classical eval=classical\n"<<std::flush;
++    }
+ }
+ 
+ void PiskvorkProtocol::clear_game(){ pos_.clear(); moveHistory_.clear(); engineColor_=Color::Black; engineColorKnown_=false; }
+@@ -70,9 +91,14 @@
+ 
+ void PiskvorkProtocol::think_and_play(){
+     ensure_memory_policy();
+-    if((ruleMask_ & 4)==0){std::cout<<"ERROR NNUE1SKHY is Renju-only (INFO rule 4 required)\n"<<std::flush;return;}
++    if((ruleMask_ & 4)==0){std::cout<<"ERROR SKHY is Renju-only (INFO rule 4 required)\n"<<std::flush;return;}
+     SearchLimits lim; lim.maxDepth=cfg_.maxDepth; lim.maxNodes=cfg_.maxNodes; lim.moveTimeMs=choose_time_ms();
++    const auto t0=std::chrono::steady_clock::now();
+     auto r=searcher_.search(pos_,lim);
++    const auto elapsedMs=std::max<long long>(1,std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-t0).count());
++    const uint64_t nps=(r.nodes*1000ULL)/static_cast<uint64_t>(elapsedMs);
++    std::cout<<"MESSAGE SKHY depth="<<r.depth<<" nodes="<<r.nodes<<" nps="<<nps<<" score="<<r.score
++             <<" time="<<elapsedMs<<"ms eval="<<(searcher_.using_nnue()?searcher_.nnue_backend_name():"classical")<<"\n"<<std::flush;
+     if(!r.bestMove.valid()) { std::cout << "ERROR no legal move\n" << std::flush; return; }
+     Color c=pos_.side_to_move();
+     if(c==Color::Black){
+@@ -124,8 +150,11 @@
+         if(line.empty()) continue;
+         if(line.rfind("START ",0)==0){
+             int n=0; try{n=std::stoi(line.substr(6));}catch(...){}
+-            if(n!=15) std::cout<<"ERROR NNUE1SKHY supports only 15x15 Renju\n";
+-            else {clear_game(); std::cout<<"OK\n";} std::cout<<std::flush;
++            if(n!=15) std::cout<<"ERROR SKHY supports only 15x15 Renju\n";
++            else if(nnueRequested_ && !nnueLoaded_) {
++                std::cout<<"ERROR SKHY NNUE load failed: "<<nnueError_<<"\n";
++            } else {clear_game(); std::cout<<"OK\n"; print_eval_message();}
++            std::cout<<std::flush;
+         } else if(line=="RESTART") {clear_game(); std::cout<<"OK\n"<<std::flush;
+         } else if(line=="BEGIN") {
+             if(!engineColorKnown_){engineColor_=Color::Black;engineColorKnown_=true;}
+@@ -148,7 +177,7 @@
+             else std::cout<<"ERROR takeback must target the last move\n"<<std::flush;
+         }
+         else if(line.rfind("INFO ",0)==0) handle_info(line.substr(5));
+-        else if(line=="ABOUT") {std::cout<<"name=\"NNUE1SKHY\", version=\"0.3.1\", author=\"NNUE1SKHY project\", country=\"KR\"\n"<<std::flush;
++        else if(line=="ABOUT") {std::cout<<"name=\""<<variant_<<"\", version=\"AB-1\", author=\"SKHY project\", country=\"KR\"\n"<<std::flush;
+         } else if(line=="END") break;
+         else std::cout<<"UNKNOWN unsupported command\n"<<std::flush;
+     }
