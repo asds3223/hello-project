@@ -20,16 +20,7 @@ jobs:
           unzip -o repaired.zip -d repaired
           cd repaired/pbrain_min
           patch -p1 < "$GITHUB_WORKSPACE/ab_pbrain/skhy_ab.patch"
-          mkdir -p src/search
-          python3 - <<'PY'
-          import base64,gzip,pathlib,re,os
-          root=pathlib.Path(os.environ["GITHUB_WORKSPACE"])
-          for src,dst in [
-              (root/"v2_stage1/search.cpp.gz.b64", pathlib.Path("src/search/search.cpp")),
-              (root/"v2_stage1/search.hpp.gz.b64", pathlib.Path("src/search/search.hpp"))]:
-              raw=re.sub(rb"\\s+",b"",src.read_bytes())
-              dst.write_bytes(gzip.decompress(base64.b64decode(raw,validate=False)))
-          PY
+          patch -p1 < "$GITHUB_WORKSPACE/v2_stage1/search-v2.patch"
       - uses: actions/upload-artifact@v4
         with:
           name: skhy-v2-stage1-source
