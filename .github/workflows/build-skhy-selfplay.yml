@@ -56,7 +56,7 @@ jobs:
         run: |
           @'
           cmake_minimum_required(VERSION 3.20)
-          project(SKHYTraining VERSION 1.0 LANGUAGES CXX)
+          project(SKHYTraining VERSION 1.2 LANGUAGES CXX)
           set(CMAKE_CXX_STANDARD 20)
           set(CMAKE_CXX_STANDARD_REQUIRED ON)
           set(CMAKE_CXX_EXTENSIONS OFF)
@@ -87,16 +87,19 @@ jobs:
           cmake -S "$env:SKHY_ROOT" -B build -G "Visual Studio 17 2022" -A x64
           cmake --build build --config Release --target SKHY-selfplay --parallel 2
 
-      - name: Smoke generate one shard
+      - name: Smoke new data-quality features
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item build/Release/SKHY-selfplay.exe dist/SKHY-selfplay.exe
-          & .\dist\SKHY-selfplay.exe --games 1 --depth 2 --movetime 5 --workers 1 --search-threads 1 --hash-mb 4 --opening-random-plies 2 --record-stride 2 --min-record-ply 2 --max-record-ply 20 --seed 123 --out smoke.bin
+          & .\dist\SKHY-selfplay.exe --games 2 --depth 2 --movetime 5 --workers 1 --search-threads 1 --hash-mb 4 --opening-random-plies 2 --record-stride 1 --min-record-ply 2 --max-record-ply 40 --topk-random-prob 1 --topk 3 --topk-margin 30000 --topk-probe-candidates 3 --topk-probe-ms 1 --topk-probe-depth 1 --midgame-start-prob 1 --midgame-start-min-ply 8 --midgame-start-max-ply 10 --midgame-seed-ms 1 --midgame-seed-depth 1 --seed 123 --out smoke.bin --aux-out smoke.aux
           if ($LASTEXITCODE -ne 0) { throw "selfplay smoke failed" }
           $size=(Get-Item smoke.bin).Length
+          $aux=(Get-Item smoke.aux).Length
           if ($size -le 0 -or ($size % 72) -ne 0) { throw "bad shard bytes: $size" }
-          Write-Host "smoke shard bytes=$size samples=$($size/72)"
+          $samples=[int]($size/72)
+          if ($aux -ne ($samples*4)) { throw "bad aux bytes: aux=$aux samples=$samples" }
+          Write-Host "smoke shard bytes=$size samples=$samples aux_bytes=$aux"
           Get-FileHash dist/SKHY-selfplay.exe -Algorithm SHA256 |
             Format-List | Out-File -Encoding ascii dist/SHA256.txt
 
