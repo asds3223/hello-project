@@ -1,0 +1,43 @@
+name: rc1-toolchain-sysroot
+on:
+  push:
+    branches:
+      - rc1-fat-windows-build-20260912
+jobs:
+  sysroot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Download xwin
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 5 --retry-delay 2 -o xwin.tar.gz https://github.com/Jake-Shadle/xwin/releases/download/0.6.5/xwin-0.6.5-x86_64-unknown-linux-musl.tar.gz
+          tar -xzf xwin.tar.gz
+          mv xwin-0.6.5-x86_64-unknown-linux-musl/xwin ./xwin
+          chmod +x ./xwin
+          ./xwin --version
+      - name: Splat official Microsoft CRT and Windows SDK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ./xwin --accept-license --arch x86_64 --sdk-version 10.0.22621 splat --output "$GITHUB_WORKSPACE/msvc-sysroot"
+          find "$GITHUB_WORKSPACE/msvc-sysroot" -maxdepth 3 -type d | head -100
+          du -sh "$GITHUB_WORKSPACE/msvc-sysroot"
+      - name: Record sysroot identity
+        shell: bash
+        run: |
+          set -euxo pipefail
+          {
+            echo 'xwin=0.6.5'
+            echo 'sdk=10.0.22621'
+            echo 'arch=x86_64'
+            find "$GITHUB_WORKSPACE/msvc-sysroot" -maxdepth 3 -type f \( -name 'vcruntime.h' -o -name 'Windows.h' -o -name 'kernel32.lib' -o -name 'libcmt.lib' \) -print
+          } > "$GITHUB_WORKSPACE/msvc-sysroot/RC1_SYSROOT_IDENTITY.txt"
+      - name: Upload MSVC Windows sysroot
+        uses: actions/upload-artifact@v4
+        with:
+          name: rc1-msvc-v143-winsdk-22621-sysroot
+          path: msvc-sysroot
+          compression-level: 6
+          retention-days: 1
