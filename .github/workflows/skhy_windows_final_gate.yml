@@ -1,0 +1,84 @@
+name: SKHY Windows Final Gate
+
+on:
+  push:
+    branches:
+      - skhy-windows-actions-final-gate
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  final-gate:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout gate payload
+        uses: actions/checkout@v4
+
+      - name: Verify and extract exact prebuilt Windows artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bundle = 'windows_gate/action_bundle.tar.xz'
+          $bundleHash = (Get-FileHash $bundle -Algorithm SHA256).Hash.ToLower()
+          if ($bundleHash -ne 'a170a7b64d951a7094ebc513c0e4d402e789a9311c93cd32c962989b5dc50596') { throw "bundle SHA mismatch: $bundleHash" }
+          New-Item -ItemType Directory -Force gate | Out-Null
+          tar -xJf $bundle -C gate
+          if ($LASTEXITCODE -ne 0) { throw "tar extraction failed: $LASTEXITCODE" }
+          $engineHash = (Get-FileHash 'gate/SKHY_NX2_RC1_WINDOWS_GATE.exe' -Algorithm SHA256).Hash.ToLower()
+          $harnessHash = (Get-FileHash 'gate/windows_gate_harness.exe' -Algorithm SHA256).Hash.ToLower()
+          $fixtureHash = (Get-FileHash 'gate/canonical48.seq' -Algorithm SHA256).Hash.ToLower()
+          if ($engineHash -ne '83924699feb1a3436e1a7125a61bc1043ee01f1418682761aaf5d81619369297') { throw "engine SHA mismatch: $engineHash" }
+          if ($harnessHash -ne '9c0a468c990481f987a03220f2b3dfc69e0b4abb8f26f2a24aad5796169e4f89') { throw "harness SHA mismatch: $harnessHash" }
+          if ($fixtureHash -ne '033a7b0c3b0f48f08123ac8b934161ca48cf4229f38d54af4d4a17a1a593c6e3') { throw "fixture SHA mismatch: $fixtureHash" }
+          @(
+            "engine $engineHash",
+            "harness $harnessHash",
+            "fixture $fixtureHash",
+            "bundle $bundleHash"
+          ) | Set-Content -Encoding ascii 'gate/SHA256.txt'
+
+      - name: A baseline fresh process
+        shell: pwsh
+        working-directory: gate
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Remove-Item Env:SKHY_DIAG_1X0_62_LMP_BYPASS -ErrorAction SilentlyContinue
+          Remove-Item Env:SKHY_DIAG_1X0_62_PROVEN_TT_DEPTH_BYPASS -ErrorAction SilentlyContinue
+          cmd /d /c "windows_gate_harness.exe canonical48.seq > A.log 2>&1"
+          if ($LASTEXITCODE -ne 0) { throw "A exit code $LASTEXITCODE" }
+
+      - name: B target-only LMP bypass fresh process
+        shell: pwsh
+        working-directory: gate
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:SKHY_DIAG_1X0_62_LMP_BYPASS = '1'
+          Remove-Item Env:SKHY_DIAG_1X0_62_PROVEN_TT_DEPTH_BYPASS -ErrorAction SilentlyContinue
+          cmd /d /c "windows_gate_harness.exe canonical48.seq > B.log 2>&1"
+          if ($LASTEXITCODE -ne 0) { throw "B exit code $LASTEXITCODE" }
+
+      - name: C LMP plus canonical proven-TT bypass fresh process
+        shell: pwsh
+        working-directory: gate
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:SKHY_DIAG_1X0_62_LMP_BYPASS = '1'
+          $env:SKHY_DIAG_1X0_62_PROVEN_TT_DEPTH_BYPASS = '1'
+          cmd /d /c "windows_gate_harness.exe canonical48.seq > C.log 2>&1"
+          if ($LASTEXITCODE -ne 0) { throw "C exit code $LASTEXITCODE" }
+
+      - name: Upload A B C logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skhy-windows-final-gate-logs
+          path: |
+            gate/A.log
+            gate/B.log
+            gate/C.log
+            gate/SHA256.txt
+          if-no-files-found: warn
+          retention-days: 30
