@@ -23,7 +23,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $bundle = 'windows_gate/action_bundle.tar.xz'
           $bundleHash = (Get-FileHash $bundle -Algorithm SHA256).Hash.ToLower()
-          if ($bundleHash -ne 'a170a7b64d951a7094ebc513c0e4d402e789a9311c93cd32c962989b5dc50596') { throw "bundle SHA mismatch: $bundleHash" }
+          if ($bundleHash -ne '4f2060278c1419543be4680366af8fe5a5a0108e6d1a762d89b919b0d8c3c98f') { throw "bundle SHA mismatch: $bundleHash" }
           New-Item -ItemType Directory -Force gate | Out-Null
           tar -xJf $bundle -C gate
           if ($LASTEXITCODE -ne 0) { throw "tar extraction failed: $LASTEXITCODE" }
